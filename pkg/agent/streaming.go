@@ -1,0 +1,574 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/Ingenimax/agent-sdk-go/pkg/interfaces"
+	"github.com/Ingenimax/agent-sdk-go/pkg/memory"
+	"github.com/Ingenimax/agent-sdk-go/pkg/multitenancy"
+)
+
+// sendEvent pushes an AgentStreamEvent onto eventChan while respecting
+// caller cancellation. Every blocking send on eventChan in this file goes
+// through this helper so that abandoning the returned channel (timeout,
+// client disconnect, etc.) doesn't leak the producing goroutine waiting
+// on an unread channel (#291). Returns true on success, false if ctx was
+// cancelled before the event could be delivered.
+func sendEvent(ctx context.Context, eventChan chan<- interfaces.AgentStreamEvent, event interfaces.AgentStreamEvent) bool {
+	select {
+	case eventChan <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// RunStream executes the agent with streaming response
+func (a *Agent) RunStream(ctx context.Context, input string) (<-chan interfaces.AgentStreamEvent, error) {
+	// If custom stream function is set, use it instead
+	if a.customRunStreamFunc != nil {
+		return a.customRunStreamFunc(ctx, input, a)
+	}
+
+	// If this is a remote agent, delegate to remote execution
+	if a.isRemote {
+		return a.runRemoteStream(ctx, input)
+	}
+
+	// Local agent execution
+	return a.runLocalStream(ctx, input)
+}
+
+// runLocalStream executes a local agent with streaming
+func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interfaces.AgentStreamEvent, error) {
+	// Check if LLM supports streaming
+	streamingLLM, ok := a.llm.(interfaces.StreamingLLM)
+	if !ok {
+		return nil, fmt.Errorf("LLM '%s' does not support streaming", a.llm.Name())
+	}
+
+	// Get buffer size from default config
+	bufferSize := 100
+
+	// Create agent event channel
+	eventChan := make(chan interfaces.AgentStreamEvent, bufferSize)
+
+	// Start streaming in a goroutine
+	go func() {
+		defer close(eventChan)
+
+		// Track execution start time
+		startTime := time.Now()
+
+		// Stamp identity before the span starts so the span is named correctly.
+		// beginRun applies it again idempotently.
+		ctx = a.applyRunIdentity(ctx)
+
+		// A configured runtime timeout bounds the whole run.
+		ctx, cancelTimeout := a.applyRunTimeout(ctx)
+		defer cancelTimeout()
+
+		// Create usage tracker for detailed metrics collection
+		tracker := newUsageTracker(true)
+		ctx = withUsageTracker(ctx, tracker)
+
+		// Track response length for span logging
+		var responseLength int64
+
+		// Start tracing if available
+		var span interfaces.Span
+		if a.tracer != nil {
+			ctx, span = a.tracer.StartSpan(ctx, "agent.RunStream")
+			defer func() {
+				// Add detailed execution information to span before ending
+				if span != nil {
+					executionTimeMs := time.Since(startTime).Milliseconds()
+					tracker.setExecutionTime(executionTimeMs)
+
+					usage, execSummary, model := tracker.getResults()
+
+					// Add comprehensive span attributes
+					spanData := map[string]interface{}{
+						"agent_name":        a.name,
+						"execution_time_ms": executionTimeMs,
+						"input_length":      len(input),
+						"response_length":   responseLength,
+					}
+
+					// Add organization and conversation context if available
+					if orgID, err := multitenancy.GetOrgID(ctx); err == nil && orgID != "" {
+						spanData["org_id"] = orgID
+					}
+					if conversationID, ok := memory.GetConversationID(ctx); ok && conversationID != "" {
+						spanData["conversation_id"] = conversationID
+					}
+
+					// Add token usage if available
+					if usage != nil {
+						spanData["input_tokens"] = usage.InputTokens
+						spanData["output_tokens"] = usage.OutputTokens
+						spanData["total_tokens"] = usage.TotalTokens
+						spanData["reasoning_tokens"] = usage.ReasoningTokens
+					}
+
+					// Add execution summary if available
+					if execSummary != nil {
+						spanData["llm_calls"] = execSummary.LLMCalls
+						spanData["tool_calls"] = execSummary.ToolCalls
+						spanData["sub_agent_calls"] = execSummary.SubAgentCalls
+						spanData["used_tools"] = execSummary.UsedTools
+						spanData["used_sub_agents"] = execSummary.UsedSubAgents
+					}
+
+					// Add model information
+					if model != "" {
+						spanData["model_used"] = model
+					} else if a.llm != nil {
+						spanData["model_used"] = a.llm.Name()
+					}
+
+					// Log detailed execution information
+					log.Printf("[Agent] RunStream execution completed: %+v", spanData)
+				}
+				span.End()
+			}()
+		}
+
+		// Apply input guardrails and persist the resulting user message. See
+		// beginRun: guardrails must run before the memory write, because the
+		// providers build their request from memory rather than from the prompt
+		// argument.
+		var processedInput string
+		var preambleErr error
+		ctx, processedInput, preambleErr = a.beginRun(ctx, input)
+		if preambleErr != nil {
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+				Type:      interfaces.AgentEventError,
+				Error:     preambleErr,
+				Timestamp: time.Now(),
+			})
+			return
+		}
+
+		// Check if the input is related to an existing plan
+		taskID, action, planInput := a.extractPlanAction(processedInput)
+		if taskID != "" {
+			// For now, plan actions are not streamed - fall back to regular handling
+			result, err := a.handlePlanAction(ctx, taskID, action, planInput)
+			if err != nil {
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventError,
+					Error:     err,
+					Timestamp: time.Now(),
+				})
+			} else {
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventContent,
+					Content:   result,
+					Timestamp: time.Now(),
+				})
+			}
+			return
+		}
+
+		// Check if the user is asking about the agent's role or identity
+		if a.systemPrompt != "" && a.isAskingAboutRole(processedInput) {
+			// A role response is produced whole rather than streamed, so output
+			// guardrails apply to it in full before anything is emitted.
+			response, finishErr := a.finishRun(ctx, a.generateRoleResponse(ctx))
+			if finishErr != nil {
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventError,
+					Error:     finishErr,
+					Timestamp: time.Now(),
+				})
+				return
+			}
+
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+				Type:      interfaces.AgentEventContent,
+				Content:   response,
+				Timestamp: time.Now(),
+			})
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+				Type:      interfaces.AgentEventComplete,
+				Timestamp: time.Now(),
+			})
+			return
+		}
+
+		// Shared with the sync path. This block previously omitted lazy MCP
+		// tools, so an agent configured with them saw a different tool set
+		// depending on whether it was streamed, and it reported collection
+		// failures via fmt.Printf rather than the agent's logger.
+		allTools := a.assembleTools(ctx)
+
+		// If tools are available and plan approval is required, we can't stream execution plans yet
+		if (len(allTools) > 0) && a.requirePlanApproval {
+			// For now, fall back to non-streaming execution plan generation
+			result, err := a.runWithExecutionPlan(ctx, processedInput, a.planGeneratorFor(allTools))
+			if err != nil {
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventError,
+					Error:     err,
+					Timestamp: time.Now(),
+				})
+			} else {
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventContent,
+					Content:   result,
+					Timestamp: time.Now(),
+				})
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+					Type:      interfaces.AgentEventComplete,
+					Timestamp: time.Now(),
+				})
+			}
+			return
+		}
+
+		// Run with streaming
+		length, err := a.runStreamingGeneration(ctx, processedInput, allTools, streamingLLM, eventChan)
+		responseLength = length
+		if err != nil {
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+				Type:      interfaces.AgentEventError,
+				Error:     err,
+				Timestamp: time.Now(),
+			})
+		}
+	}()
+
+	return eventChan, nil
+}
+
+// runStreamingGeneration handles the core streaming generation logic
+func (a *Agent) runStreamingGeneration(
+	ctx context.Context,
+	input string,
+	allTools []interfaces.Tool,
+	streamingLLM interfaces.StreamingLLM,
+	eventChan chan<- interfaces.AgentStreamEvent,
+) (int64, error) {
+	// Prepare generation options
+	options := []interfaces.GenerateOption{}
+
+	// Add system prompt if available
+	if a.systemPrompt != "" {
+		options = append(options, func(opts *interfaces.GenerateOptions) {
+			opts.SystemMessage = a.systemPrompt
+		})
+	}
+
+	// Add LLM config if available
+	if a.llmConfig != nil {
+		options = append(options, func(opts *interfaces.GenerateOptions) {
+			opts.LLMConfig = a.llmConfig
+		})
+	}
+
+	// Add response format if available
+	if a.responseFormat != nil {
+		options = append(options, func(opts *interfaces.GenerateOptions) {
+			opts.ResponseFormat = a.responseFormat
+		})
+	}
+
+	// Add max iterations if available
+	if a.maxIterations > 0 {
+		options = append(options, interfaces.WithMaxIterations(a.maxIterations))
+	}
+
+	// Add memory if available
+	if a.memory != nil {
+		options = append(options, interfaces.WithMemory(a.memory))
+	}
+
+	// Add stream config if available
+	if a.streamConfig != nil {
+		options = append(options, interfaces.WithStreamConfig(*a.streamConfig))
+	}
+
+	// Add cache config if available
+	if a.cacheConfig != nil {
+		options = append(options, func(opts *interfaces.GenerateOptions) {
+			opts.CacheConfig = a.cacheConfig
+		})
+	}
+
+	// Inject stream forwarder into context so sub-agents can forward their events
+	// This allows nested sub-agent streaming to work properly
+	streamForwarder := func(event interfaces.AgentStreamEvent) {
+		// Forward sub-agent events to the parent agent's event channel
+		select {
+		case eventChan <- event:
+		case <-ctx.Done():
+			// Context cancelled, stop forwarding
+		}
+	}
+
+	// Add the stream forwarder to context
+	// This is used by the tools package's AgentTool to forward sub-agent events
+	ctxWithForwarder := context.WithValue(ctx, interfaces.StreamForwarderKey, interfaces.StreamForwarder(streamForwarder))
+
+	// Start LLM streaming
+	var llmEventChan <-chan interfaces.StreamEvent
+	var err error
+
+	if len(allTools) > 0 {
+		// Record tool invocations as the LLM actually calls them, not the
+		// full set of available tools (#305).
+		toolsForLLM := a.decorateTools(allTools, getUsageTracker(ctx))
+		llmEventChan, err = streamingLLM.GenerateWithToolsStream(ctxWithForwarder, input, toolsForLLM, options...)
+	} else {
+		llmEventChan, err = streamingLLM.GenerateStream(ctxWithForwarder, input, options...)
+	}
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to start LLM streaming: %w", err)
+	}
+
+	// Track accumulated content and tool calls for memory
+	var accumulatedContent strings.Builder
+	var toolCalls []interfaces.ToolCall
+	var toolResults map[string]string // map[toolCallID]result
+	var finalError error
+
+	toolResults = make(map[string]string)
+
+	// Forward LLM events as agent events
+	for llmEvent := range llmEventChan {
+		agentEvent := a.convertLLMEventToAgentEvent(llmEvent, allTools)
+
+		// Accumulate content for memory (not thinking)
+		if llmEvent.Type == interfaces.StreamEventContentDelta {
+			accumulatedContent.WriteString(llmEvent.Content)
+		}
+
+		// Track tool calls for memory
+		if llmEvent.Type == interfaces.StreamEventToolUse && llmEvent.ToolCall != nil {
+			toolCalls = append(toolCalls, *llmEvent.ToolCall)
+		}
+
+		// Track tool results for memory
+		if llmEvent.Type == interfaces.StreamEventToolResult && llmEvent.ToolCall != nil {
+			toolResults[llmEvent.ToolCall.ID] = llmEvent.Content
+		}
+
+		// Feed provider-reported token usage into the tracker.
+		//
+		// The streaming LLM methods return only an event channel, with no
+		// *interfaces.LLMResponse for runLocalWithTracking to read, so the
+		// terminal event's metadata is the only path by which token counts
+		// reach the tracker. Without this, RunDetailed via the streaming path
+		// reported zero tokens whenever the agent had tools (#327).
+		if usage, model, ok := llmUsageFromEvent(llmEvent); ok {
+			if tracker := getUsageTracker(ctx); tracker != nil {
+				tracker.addLLMUsage(usage, model)
+			}
+		}
+
+		// Track errors
+		if llmEvent.Error != nil {
+			finalError = llmEvent.Error
+		}
+
+		// Send agent event
+		if !sendEvent(ctx, eventChan, agentEvent) {
+			return int64(accumulatedContent.Len()), finalError
+		}
+	}
+
+	// Add messages to memory if available (save even on error to preserve conversation history)
+	if a.memory != nil {
+		// If we have tool calls, save them in the correct order
+		if len(toolCalls) > 0 {
+			// Add assistant message with tool calls
+			err := a.memory.AddMessage(ctx, interfaces.Message{
+				Role:      "assistant",
+				Content:   accumulatedContent.String(), // May be empty or contain text before tools
+				ToolCalls: toolCalls,
+			})
+			if err != nil {
+				fmt.Printf("Warning: Failed to add assistant message with tool calls to memory: %v\n", err)
+			}
+
+			// Add tool result messages
+			for _, toolCall := range toolCalls {
+				if result, ok := toolResults[toolCall.ID]; ok {
+					err := a.memory.AddMessage(ctx, interfaces.Message{
+						Role:       "tool",
+						Content:    result,
+						ToolCallID: toolCall.ID,
+						Metadata: map[string]interface{}{
+							"tool_name": toolCall.Name,
+						},
+					})
+					if err != nil {
+						fmt.Printf("Warning: Failed to add tool result to memory: %v\n", err)
+					}
+				}
+			}
+		} else if accumulatedContent.Len() > 0 {
+			// No tool calls, just content - add assistant message.
+			//
+			// Output guardrails are applied before the text is persisted, so the
+			// transcript holds what the guardrail approved and the next turn
+			// replays that rather than raw model output.
+			//
+			// LIMITATION: the deltas have already been streamed to the consumer by
+			// this point, so this does NOT retroactively guard what the caller saw.
+			// Guarding a stream as it is produced needs a design decision that has
+			// not been made -- see docs/guardrails.md.
+			guarded, guardErr := a.guardOutput(ctx, accumulatedContent.String())
+			if guardErr != nil {
+				a.logger.Error(ctx, "Output guardrails rejected the streamed response; it was not persisted", map[string]interface{}{
+					"error": guardErr.Error(),
+				})
+			} else if err := a.memory.AddMessage(ctx, interfaces.Message{
+				Role:    "assistant",
+				Content: guarded,
+			}); err != nil {
+				a.logger.Warn(ctx, "Failed to add assistant response to memory", map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+		}
+	}
+
+	// Send completion event. Usage rides on the metadata so a consumer -- most
+	// importantly AgentTool wrapping this agent as a sub-agent -- can recover
+	// token accounting without executing the agent a second time.
+	completionMeta := map[string]interface{}{
+		"total_content_length": accumulatedContent.Len(),
+		"had_error":            finalError != nil,
+	}
+	if tracker := getUsageTracker(ctx); tracker != nil {
+		if usage, execSummary, model := tracker.getResults(); usage != nil {
+			completionMeta[interfaces.MetadataKeyUsage] = usage
+			completionMeta[interfaces.MetadataKeyModel] = model
+			if execSummary != nil {
+				completionMeta[interfaces.MetadataKeyExecutionSummary] = *execSummary
+			}
+		}
+	}
+
+	sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
+		Type:      interfaces.AgentEventComplete,
+		Timestamp: time.Now(),
+		Metadata:  completionMeta,
+	})
+
+	return int64(accumulatedContent.Len()), finalError
+}
+
+// getToolMetadata retrieves display name and internal flag for a tool
+func getToolMetadata(toolName string, tools []interfaces.Tool) (displayName string, internal bool) {
+	displayName = toolName
+	internal = false
+
+	for _, tool := range tools {
+		if tool.Name() == toolName {
+			if toolWithDisplayName, ok := tool.(interfaces.ToolWithDisplayName); ok {
+				if dn := toolWithDisplayName.DisplayName(); dn != "" {
+					displayName = dn
+				}
+			}
+			if internalTool, ok := tool.(interfaces.InternalTool); ok {
+				internal = internalTool.Internal()
+			}
+			break
+		}
+	}
+
+	return displayName, internal
+}
+
+// convertLLMEventToAgentEvent converts LLM events to agent events
+func (a *Agent) convertLLMEventToAgentEvent(llmEvent interfaces.StreamEvent, tools []interfaces.Tool) interfaces.AgentStreamEvent {
+	agentEvent := interfaces.AgentStreamEvent{
+		Timestamp: llmEvent.Timestamp,
+		Metadata:  llmEvent.Metadata,
+	}
+
+	// Convert event types
+	switch llmEvent.Type {
+	case interfaces.StreamEventMessageStart:
+		agentEvent.Type = interfaces.AgentEventContent
+		agentEvent.Content = llmEvent.Content
+
+	case interfaces.StreamEventContentDelta:
+		agentEvent.Type = interfaces.AgentEventContent
+		agentEvent.Content = llmEvent.Content
+
+	case interfaces.StreamEventContentComplete:
+		agentEvent.Type = interfaces.AgentEventContent
+		agentEvent.Content = llmEvent.Content
+
+	case interfaces.StreamEventThinking:
+		agentEvent.Type = interfaces.AgentEventThinking
+		agentEvent.ThinkingStep = llmEvent.Content
+
+	case interfaces.StreamEventToolUse:
+		agentEvent.Type = interfaces.AgentEventToolCall
+		if llmEvent.ToolCall != nil {
+			displayName, internal := getToolMetadata(llmEvent.ToolCall.Name, tools)
+			agentEvent.ToolCall = &interfaces.ToolCallEvent{
+				ID:          llmEvent.ToolCall.ID,
+				Name:        llmEvent.ToolCall.Name,
+				DisplayName: displayName,
+				Internal:    internal,
+				Arguments:   llmEvent.ToolCall.Arguments,
+				Status:      "received",
+			}
+		}
+
+	case interfaces.StreamEventToolResult:
+		agentEvent.Type = interfaces.AgentEventToolResult
+		if llmEvent.ToolCall != nil {
+			displayName, internal := getToolMetadata(llmEvent.ToolCall.Name, tools)
+			agentEvent.ToolCall = &interfaces.ToolCallEvent{
+				ID:          llmEvent.ToolCall.ID,
+				Name:        llmEvent.ToolCall.Name,
+				DisplayName: displayName,
+				Internal:    internal,
+				Arguments:   llmEvent.ToolCall.Arguments,
+				Result:      llmEvent.Content, // Tool result is in Content field of StreamEvent
+				Status:      "completed",
+			}
+		}
+
+	case interfaces.StreamEventError:
+		agentEvent.Type = interfaces.AgentEventError
+		agentEvent.Error = llmEvent.Error
+
+	case interfaces.StreamEventMessageStop:
+		agentEvent.Type = interfaces.AgentEventContent
+		agentEvent.Content = llmEvent.Content
+
+	default:
+		// Unknown event type, treat as content
+		agentEvent.Type = interfaces.AgentEventContent
+		agentEvent.Content = llmEvent.Content
+	}
+
+	return agentEvent
+}
+
+// runRemoteStream handles streaming for remote agents
+func (a *Agent) runRemoteStream(ctx context.Context, input string) (<-chan interfaces.AgentStreamEvent, error) {
+	if a.remoteClient == nil {
+		return nil, fmt.Errorf("remote client not initialized")
+	}
+
+	// If orgID is set on the agent, add it to the context
+	if a.orgID != "" {
+		ctx = multitenancy.WithOrgID(ctx, a.orgID)
+	}
+
+	return a.remoteClient.RunStream(ctx, input)
+}

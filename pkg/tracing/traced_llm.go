@@ -1,0 +1,468 @@
+package tracing
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Ingenimax/agent-sdk-go/pkg/interfaces"
+)
+
+// TracedLLM implements middleware for LLM calls with unified tracing
+type TracedLLM struct {
+	llm    interfaces.LLM
+	tracer interfaces.Tracer
+}
+
+// NewTracedLLM creates a new LLM middleware with unified tracing
+func NewTracedLLM(llm interfaces.LLM, tracer interfaces.Tracer) interfaces.LLM {
+	return &TracedLLM{
+		llm:    llm,
+		tracer: tracer,
+	}
+}
+
+// shouldIncludeContent checks if the tracer supports and has enabled content inclusion
+func (m *TracedLLM) shouldIncludeContent() bool {
+	if adapter, ok := m.tracer.(*OTELTracerAdapter); ok {
+		return adapter.otelTracer.ShouldIncludeContent()
+	}
+	if tracer, ok := m.tracer.(*OTELLangfuseTracer); ok {
+		return tracer.ShouldIncludeContent()
+	}
+	return false
+}
+
+// Generate generates text from a prompt with tracing
+func (m *TracedLLM) Generate(ctx context.Context, prompt string, options ...interfaces.GenerateOption) (string, error) {
+	startTime := time.Now()
+
+	// Start span
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate")
+	defer span.End()
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Call the underlying LLM
+	response, err := m.llm.Generate(ctx, prompt, options...)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+
+	// Add response attributes
+	if err == nil {
+		span.SetAttribute("response.length", len(response))
+		span.SetAttribute("response.hash", hashString(response))
+		span.SetAttribute("duration_ms", duration.Milliseconds())
+
+		// Include actual content if configured
+		if m.shouldIncludeContent() {
+			span.SetAttribute("prompt.content", prompt)
+			span.SetAttribute("response.content", response)
+		}
+	} else {
+		span.RecordError(err)
+	}
+
+	return response, err
+}
+
+// GenerateWithTools generates text from a prompt with tools using unified tracing
+func (m *TracedLLM) GenerateWithTools(ctx context.Context, prompt string, tools []interfaces.Tool, options ...interfaces.GenerateOption) (string, error) {
+	// First check if underlying LLM supports GenerateWithTools
+	if llmWithTools, ok := m.llm.(interface {
+		GenerateWithTools(ctx context.Context, prompt string, tools []interfaces.Tool, options ...interfaces.GenerateOption) (string, error)
+	}); ok {
+		startTime := time.Now()
+
+		// Start span
+		ctx, span := m.tracer.StartSpan(ctx, "llm.generate_with_tools")
+		defer span.End()
+
+		// Add attributes
+		span.SetAttribute("prompt.length", len(prompt))
+		span.SetAttribute("prompt.hash", hashString(prompt))
+		span.SetAttribute("tools.count", len(tools))
+
+		// Extract model name from LLM client
+		model := "unknown"
+		if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+			model = modelProvider.GetModel()
+		}
+		if model == "" {
+			model = m.llm.Name() // fallback to provider name
+		}
+		span.SetAttribute("model", model)
+
+		// Add tool names if available
+		if len(tools) > 0 {
+			toolNames := make([]string, len(tools))
+			for i, tool := range tools {
+				toolNames[i] = tool.Name()
+			}
+			span.SetAttribute("tools", strings.Join(toolNames, ","))
+		}
+
+		// Initialize tool calls collection in context for tracing
+		ctx = WithToolCallsCollection(ctx)
+
+		// Call the underlying LLM's GenerateWithTools method
+		response, err := llmWithTools.GenerateWithTools(ctx, prompt, tools, options...)
+
+		endTime := time.Now()
+		duration := endTime.Sub(startTime)
+
+		// Add response attributes
+		if err == nil {
+			span.SetAttribute("response.length", len(response))
+			span.SetAttribute("response.hash", hashString(response))
+			span.SetAttribute("duration_ms", duration.Milliseconds())
+
+			// Include actual content if configured
+			if m.shouldIncludeContent() {
+				span.SetAttribute("prompt.content", prompt)
+				span.SetAttribute("response.content", response)
+			}
+		} else {
+			span.RecordError(err)
+		}
+
+		// Mirror the streaming path: if any tool calls were collected, emit a
+		// generation span via TraceGeneration so Langfuse / OTEL backends record
+		// the call graph for non-streaming runs too (#295).
+		if toolCalls := GetToolCallsFromContext(ctx); len(toolCalls) > 0 {
+			responseText := response
+			if !m.shouldIncludeContent() {
+				responseText = "<redacted>"
+			}
+			metadata := map[string]any{
+				"streaming": false,
+				"tools":     len(tools),
+			}
+			// Stamp the error so downstream backends can distinguish a
+			// failed generation from a successful one with empty content.
+			if err != nil {
+				metadata["error"] = err.Error()
+				if responseText == "" {
+					responseText = "<error>"
+				}
+			}
+			if adapter, ok := m.tracer.(*OTELTracerAdapter); ok {
+				_, _ = adapter.otelTracer.TraceGeneration(ctx, model, prompt, responseText, startTime, endTime, metadata) //nolint:gosec
+			} else if tracer, ok := m.tracer.(*OTELLangfuseTracer); ok {
+				_, _ = tracer.TraceGeneration(ctx, model, prompt, responseText, startTime, endTime, metadata) //nolint:gosec
+			}
+		}
+
+		return response, err
+	}
+
+	// Fallback to regular Generate if GenerateWithTools is not supported
+	return m.Generate(ctx, prompt, options...)
+}
+
+// Name implements interfaces.LLM.Name
+func (m *TracedLLM) Name() string {
+	return m.llm.Name()
+}
+
+// SupportsStreaming implements interfaces.LLM.SupportsStreaming
+func (m *TracedLLM) SupportsStreaming() bool {
+	return m.llm.SupportsStreaming()
+}
+
+// GetModel returns the model name from the underlying LLM
+func (m *TracedLLM) GetModel() string {
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		return modelProvider.GetModel()
+	}
+	// Fallback to provider name if GetModel is not available
+	return m.llm.Name()
+}
+
+// GenerateStream implements interfaces.StreamingLLM.GenerateStream
+func (m *TracedLLM) GenerateStream(ctx context.Context, prompt string, options ...interfaces.GenerateOption) (<-chan interfaces.StreamEvent, error) {
+	// Check if underlying LLM supports streaming
+	streamingLLM, ok := m.llm.(interfaces.StreamingLLM)
+	if !ok {
+		return nil, fmt.Errorf("underlying LLM does not support streaming")
+	}
+
+	// Start span
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate_stream")
+	defer span.End()
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+	span.SetAttribute("streaming", true)
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Include actual prompt content if configured (response is streamed)
+	if m.shouldIncludeContent() {
+		span.SetAttribute("prompt.content", prompt)
+	}
+
+	return streamingLLM.GenerateStream(ctx, prompt, options...)
+}
+
+// GenerateWithToolsStream implements interfaces.StreamingLLM.GenerateWithToolsStream
+func (m *TracedLLM) GenerateWithToolsStream(ctx context.Context, prompt string, tools []interfaces.Tool, options ...interfaces.GenerateOption) (<-chan interfaces.StreamEvent, error) {
+	// Check if underlying LLM supports streaming with tools
+	streamingLLM, ok := m.llm.(interfaces.StreamingLLM)
+	if !ok {
+		return nil, fmt.Errorf("underlying LLM does not support streaming")
+	}
+
+	// Start span
+	startTime := time.Now()
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate_with_tools_stream")
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+	span.SetAttribute("streaming", true)
+	span.SetAttribute("tools.count", len(tools))
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Add tool names if available
+	if len(tools) > 0 {
+		toolNames := make([]string, len(tools))
+		for i, tool := range tools {
+			toolNames[i] = tool.Name()
+		}
+		span.SetAttribute("tools", strings.Join(toolNames, ","))
+	}
+
+	// Include actual prompt content if configured (response is streamed)
+	if m.shouldIncludeContent() {
+		span.SetAttribute("prompt.content", prompt)
+	}
+
+	// Initialize tool calls collection in context for tracing
+	ctx = WithToolCallsCollection(ctx)
+
+	// Get the original stream
+	originalChan, err := streamingLLM.GenerateWithToolsStream(ctx, prompt, tools, options...)
+	if err != nil {
+		span.RecordError(err)
+		span.End()
+		return nil, err
+	}
+
+	// Create a new channel to wrap the original
+	wrappedChan := make(chan interfaces.StreamEvent, 10)
+
+	// Start a goroutine to proxy events and handle span completion
+	go func() {
+		defer close(wrappedChan)
+
+		var streamErr error
+
+		defer func() {
+			// When streaming is complete, create tool call spans and end main span
+			endTime := time.Now()
+			duration := endTime.Sub(startTime)
+			span.SetAttribute("duration_ms", duration.Milliseconds())
+
+			// Record streaming error on span if one was captured (#328)
+			if streamErr != nil {
+				span.RecordError(streamErr)
+			}
+
+			// Get tool calls from context and create spans using TraceGeneration if any exist
+			toolCalls := GetToolCallsFromContext(ctx)
+
+			if len(toolCalls) > 0 {
+				// Extract model name
+				model := "unknown"
+				if modelProvider, ok := streamingLLM.(interface{ GetModel() string }); ok {
+					model = modelProvider.GetModel()
+				}
+				if model == "" {
+					model = streamingLLM.Name()
+				}
+
+				// Build metadata, including error if the stream failed mid-flight (#328)
+				metadata := map[string]any{
+					"streaming": true,
+					"tools":     len(tools),
+				}
+				if streamErr != nil {
+					metadata["error"] = streamErr.Error()
+				}
+
+				responseText := "streaming_response"
+				if streamErr != nil {
+					if m.shouldIncludeContent() {
+						responseText = "<error>"
+					} else {
+						responseText = "<redacted>"
+					}
+				}
+
+				// Create spans using TraceGeneration which handles tool calls correctly
+				if adapter, ok := m.tracer.(*OTELTracerAdapter); ok {
+					_, _ = adapter.otelTracer.TraceGeneration(ctx, model, prompt, responseText, startTime, endTime, metadata) //nolint:gosec
+				} else if tracer, ok := m.tracer.(*OTELLangfuseTracer); ok {
+					_, _ = tracer.TraceGeneration(ctx, model, prompt, responseText, startTime, endTime, metadata) //nolint:gosec
+				}
+			}
+
+			span.End()
+		}()
+
+		// Proxy all events from the original channel, capturing any error event (#328)
+		for event := range originalChan {
+			if event.Type == interfaces.StreamEventError && event.Error != nil {
+				streamErr = event.Error
+			}
+			wrappedChan <- event
+		}
+	}()
+
+	return wrappedChan, nil
+}
+
+// GenerateDetailed generates text and returns detailed response information including token usage
+func (m *TracedLLM) GenerateDetailed(ctx context.Context, prompt string, options ...interfaces.GenerateOption) (*interfaces.LLMResponse, error) {
+	startTime := time.Now()
+
+	// Start span
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate_detailed")
+	defer span.End()
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Call the underlying LLM
+	response, err := m.llm.GenerateDetailed(ctx, prompt, options...)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// Set response attributes
+	span.SetAttribute("response.length", len(response.Content))
+	span.SetAttribute("response.model", response.Model)
+	if response.Usage != nil {
+		span.SetAttribute("usage.input_tokens", response.Usage.InputTokens)
+		span.SetAttribute("usage.output_tokens", response.Usage.OutputTokens)
+		span.SetAttribute("usage.total_tokens", response.Usage.TotalTokens)
+		if response.Usage.ReasoningTokens > 0 {
+			span.SetAttribute("usage.reasoning_tokens", response.Usage.ReasoningTokens)
+		}
+	}
+	span.SetAttribute("duration_ms", duration.Milliseconds())
+
+	// Include actual content if configured
+	if m.shouldIncludeContent() {
+		span.SetAttribute("prompt.content", prompt)
+		span.SetAttribute("response.content", response.Content)
+	}
+
+	return response, nil
+}
+
+// GenerateWithToolsDetailed generates text with tools and returns detailed response information including token usage
+func (m *TracedLLM) GenerateWithToolsDetailed(ctx context.Context, prompt string, tools []interfaces.Tool, options ...interfaces.GenerateOption) (*interfaces.LLMResponse, error) {
+	startTime := time.Now()
+
+	// Start span
+	ctx, span := m.tracer.StartSpan(ctx, "llm.generate_with_tools_detailed")
+	defer span.End()
+
+	// Add attributes
+	span.SetAttribute("prompt.length", len(prompt))
+	span.SetAttribute("prompt.hash", hashString(prompt))
+	span.SetAttribute("tools.count", len(tools))
+
+	// Extract model name from LLM client
+	model := "unknown"
+	if modelProvider, ok := m.llm.(interface{ GetModel() string }); ok {
+		model = modelProvider.GetModel()
+	}
+	if model == "" {
+		model = m.llm.Name() // fallback to provider name
+	}
+	span.SetAttribute("model", model)
+
+	// Add tool names as attributes
+	toolNames := make([]string, len(tools))
+	for i, tool := range tools {
+		toolNames[i] = tool.Name()
+	}
+	span.SetAttribute("tools.names", strings.Join(toolNames, ","))
+
+	// Call the underlying LLM
+	response, err := m.llm.GenerateWithToolsDetailed(ctx, prompt, tools, options...)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// Set response attributes
+	span.SetAttribute("response.length", len(response.Content))
+	span.SetAttribute("response.model", response.Model)
+	if response.Usage != nil {
+		span.SetAttribute("usage.input_tokens", response.Usage.InputTokens)
+		span.SetAttribute("usage.output_tokens", response.Usage.OutputTokens)
+		span.SetAttribute("usage.total_tokens", response.Usage.TotalTokens)
+		if response.Usage.ReasoningTokens > 0 {
+			span.SetAttribute("usage.reasoning_tokens", response.Usage.ReasoningTokens)
+		}
+	}
+	span.SetAttribute("duration_ms", duration.Milliseconds())
+
+	return response, nil
+}

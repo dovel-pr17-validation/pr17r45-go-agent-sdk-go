@@ -1,0 +1,518 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Ingenimax/agent-sdk-go/pkg/interfaces"
+	"github.com/Ingenimax/agent-sdk-go/pkg/logging"
+	"github.com/Ingenimax/agent-sdk-go/pkg/tracing"
+)
+
+// Context keys for sub-agent metadata
+type contextKey string
+
+const (
+	recursionDepthKey contextKey = "recursion_depth"
+	subAgentNameKey   contextKey = "sub_agent_name"
+	parentAgentKey    contextKey = "parent_agent"
+	invocationIDKey   contextKey = "invocation_id"
+
+	// MaxRecursionDepth is the maximum allowed recursion depth
+	MaxRecursionDepth = 5
+)
+
+// AgentTool wraps an agent to make it callable as a tool
+type AgentTool struct {
+	agent       SubAgent
+	name        string
+	description string
+	timeout     time.Duration
+	logger      logging.Logger
+	tracer      interfaces.Tracer
+}
+
+// SubAgent interface defines the minimal interface needed for a sub-agent
+type SubAgent interface {
+	Run(ctx context.Context, input string) (string, error)
+	RunStream(ctx context.Context, input string) (<-chan interfaces.AgentStreamEvent, error)
+	RunDetailed(ctx context.Context, input string) (*interfaces.AgentResponse, error)
+	GetName() string
+	GetDescription() string
+}
+
+// NewAgentTool creates a new agent tool wrapper
+func NewAgentTool(agent SubAgent) *AgentTool {
+	return &AgentTool{
+		agent:       agent,
+		name:        fmt.Sprintf("%s_agent", agent.GetName()),
+		description: agent.GetDescription(),
+		timeout:     30 * time.Minute, // 30 minutes - increased timeout for long-running sub-agents
+		logger:      logging.New(),    // Default logger
+	}
+}
+
+// WithTimeout sets a custom timeout for the agent tool
+func (at *AgentTool) WithTimeout(timeout time.Duration) *AgentTool {
+	at.timeout = timeout
+	return at
+}
+
+// WithLogger sets a custom logger for the agent tool
+func (at *AgentTool) WithLogger(logger logging.Logger) *AgentTool {
+	at.logger = logger
+	return at
+}
+
+// WithTracer sets a custom tracer for the agent tool
+func (at *AgentTool) WithTracer(tracer interfaces.Tracer) *AgentTool {
+	at.tracer = tracer
+	return at
+}
+
+// Name returns the name of the tool
+func (at *AgentTool) Name() string {
+	return at.name
+}
+
+// DisplayName implements interfaces.ToolWithDisplayName.DisplayName
+func (at *AgentTool) DisplayName() string {
+	return fmt.Sprintf("%s Agent", at.agent.GetName())
+}
+
+// Description returns the description of what the tool does
+func (at *AgentTool) Description() string {
+	if at.description != "" {
+		return at.description
+	}
+	return fmt.Sprintf("Delegate task to %s agent for specialized handling", at.agent.GetName())
+}
+
+// Internal implements interfaces.InternalTool.Internal
+func (at *AgentTool) Internal() bool {
+	return false
+}
+
+// Parameters returns the parameters that the tool accepts
+func (at *AgentTool) Parameters() map[string]interfaces.ParameterSpec {
+	return map[string]interfaces.ParameterSpec{
+		"query": {
+			Type:        "string",
+			Description: fmt.Sprintf("The query or task to send to the %s agent", at.agent.GetName()),
+			Required:    true,
+		},
+		"context": {
+			Type:        "object",
+			Description: "Optional context information for the sub-agent",
+			Required:    false,
+		},
+	}
+}
+
+// Run executes the tool with the given input
+func (at *AgentTool) Run(ctx context.Context, input string) (string, error) {
+	startTime := time.Now()
+	agentName := at.agent.GetName()
+
+	// Start tracing span if tracer is available
+	var span interfaces.Span
+	if at.tracer != nil {
+		ctx, span = at.tracer.StartSpan(ctx, fmt.Sprintf("sub_agent.%s", agentName))
+		defer span.End()
+
+		// Add span attributes
+		span.SetAttribute("sub_agent.name", agentName)
+		span.SetAttribute("sub_agent.input", input)
+		span.SetAttribute("sub_agent.tool_name", at.name)
+	}
+
+	// Add agent name to context for tracing
+	ctx = tracing.WithAgentName(ctx, agentName)
+
+	// Check recursion depth
+	depth := getRecursionDepth(ctx)
+	if depth > MaxRecursionDepth {
+		err := fmt.Errorf("maximum recursion depth %d exceeded (current: %d)", MaxRecursionDepth, depth)
+		if span != nil {
+			span.AddEvent("error", map[string]interface{}{
+				"error": err.Error(),
+			})
+			span.SetAttribute("sub_agent.error", err.Error())
+		}
+		at.logger.Error(ctx, "Sub-agent recursion depth exceeded", map[string]interface{}{
+			"sub_agent":       agentName,
+			"recursion_depth": depth,
+			"max_depth":       MaxRecursionDepth,
+		})
+		return "", err
+	}
+
+	// Update context with sub-agent metadata
+	ctx = context.WithValue(ctx, subAgentNameKey, agentName)
+	ctx = context.WithValue(ctx, parentAgentKey, "main")
+	ctx = context.WithValue(ctx, recursionDepthKey, depth+1)
+
+	// Bound the sub-agent by its own timeout, but always keep it a child of the
+	// caller's context so cancelling the parent run cancels the sub-agent too.
+	//
+	// This previously called context.WithoutCancel when the parent deadline was
+	// shorter than at.timeout, in order to "extend" the sub-agent's budget. That
+	// also severed cancellation propagation, which the comment did not say: with
+	// the default 30 minute timeout, cancelling a parent run left the sub-agent
+	// running for up to half an hour, still writing into shared memory, long
+	// after the caller had gone. A sub-agent outliving the run that spawned it is
+	// never what the caller asked for, so the parent deadline now wins.
+	parentDeadline, hasDeadline := ctx.Deadline()
+	if hasDeadline && parentDeadline.Before(time.Now().Add(at.timeout)) {
+		at.logger.Warn(ctx, "Parent deadline is earlier than the sub-agent timeout; the parent deadline applies", map[string]interface{}{
+			"parent_deadline": parentDeadline.Format(time.RFC3339),
+			"desired_timeout": at.timeout.String(),
+			"sub_agent":       agentName,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, at.timeout)
+	defer cancel()
+
+	// Log sub-agent invocation with debug details
+	at.logger.Debug(ctx, "Invoking sub-agent", map[string]interface{}{
+		"sub_agent":       agentName,
+		"tool_name":       at.name,
+		"input_prompt":    input,
+		"recursion_depth": depth + 1,
+		"timeout":         at.timeout.String(),
+	})
+
+	// Check if we have a stream forwarder in the context
+	var response *interfaces.AgentResponse
+	var err error
+
+	if forwarder, ok := ctx.Value(interfaces.StreamForwarderKey).(interfaces.StreamForwarder); ok && forwarder != nil {
+		// Stream the sub-agent's events to the parent and build the response from
+		// what was observed.
+		//
+		// This used to call at.agent.RunDetailed(ctx, input) after streaming had
+		// already completed, purely to recover Usage for logging and span
+		// attributes -- which ran the entire sub-agent a second time and billed
+		// for it. Any parent that streamed paid twice for every sub-agent call.
+		// Usage now rides on the completion event instead.
+		response, err = at.runWithStreaming(ctx, input, forwarder, span, agentName)
+	} else {
+		// Fall back to detailed execution for full tracking
+		response, err = at.agent.RunDetailed(ctx, input)
+	}
+
+	duration := time.Since(startTime)
+
+	if err != nil {
+		// Log error details
+		at.logger.Error(ctx, "Sub-agent execution failed", map[string]interface{}{
+			"sub_agent": agentName,
+			"tool_name": at.name,
+			"error":     err.Error(),
+			"duration":  duration.String(),
+			"input":     input,
+		})
+
+		// Record error in span
+		if span != nil {
+			span.AddEvent("error", map[string]interface{}{
+				"error": err.Error(),
+			})
+			span.SetAttribute("sub_agent.error", err.Error())
+			span.SetAttribute("sub_agent.duration_ms", duration.Milliseconds())
+		}
+
+		return "", fmt.Errorf("sub-agent %s failed: %w", agentName, err)
+	}
+
+	// Log comprehensive execution details
+	executionDetails := map[string]interface{}{
+		"sub_agent":         agentName,
+		"tool_name":         at.name,
+		"input_prompt":      input,
+		"response_content":  response.Content,
+		"response_length":   len(response.Content),
+		"duration":          duration.String(),
+		"agent_name":        response.AgentName,
+		"model_used":        response.Model,
+		"llm_calls":         response.ExecutionSummary.LLMCalls,
+		"tool_calls":        response.ExecutionSummary.ToolCalls,
+		"sub_agent_calls":   response.ExecutionSummary.SubAgentCalls,
+		"execution_time_ms": response.ExecutionSummary.ExecutionTimeMs,
+		"used_tools":        response.ExecutionSummary.UsedTools,
+		"used_sub_agents":   response.ExecutionSummary.UsedSubAgents,
+	}
+
+	// Add token usage details if available
+	if response.Usage != nil {
+		executionDetails["input_tokens"] = response.Usage.InputTokens
+		executionDetails["output_tokens"] = response.Usage.OutputTokens
+		executionDetails["total_tokens"] = response.Usage.TotalTokens
+		executionDetails["reasoning_tokens"] = response.Usage.ReasoningTokens
+	}
+
+	// Add metadata if available
+	if response.Metadata != nil {
+		executionDetails["metadata"] = response.Metadata
+	}
+
+	at.logger.Info(ctx, "Sub-agent execution completed with detailed tracking", executionDetails)
+
+	// Record detailed success information in span
+	if span != nil {
+		span.SetAttribute("sub_agent.response", response.Content)
+		span.SetAttribute("sub_agent.duration_ms", duration.Milliseconds())
+		span.SetAttribute("sub_agent.response_length", len(response.Content))
+		span.SetAttribute("sub_agent.success", true)
+		span.SetAttribute("sub_agent.agent_name", response.AgentName)
+		span.SetAttribute("sub_agent.model_used", response.Model)
+		span.SetAttribute("sub_agent.llm_calls", response.ExecutionSummary.LLMCalls)
+		span.SetAttribute("sub_agent.tool_calls", response.ExecutionSummary.ToolCalls)
+		span.SetAttribute("sub_agent.sub_agent_calls", response.ExecutionSummary.SubAgentCalls)
+		span.SetAttribute("sub_agent.execution_time_ms", response.ExecutionSummary.ExecutionTimeMs)
+
+		// Add token usage to span if available
+		if response.Usage != nil {
+			span.SetAttribute("sub_agent.input_tokens", response.Usage.InputTokens)
+			span.SetAttribute("sub_agent.output_tokens", response.Usage.OutputTokens)
+			span.SetAttribute("sub_agent.total_tokens", response.Usage.TotalTokens)
+			span.SetAttribute("sub_agent.reasoning_tokens", response.Usage.ReasoningTokens)
+		}
+	}
+
+	return response.Content, nil
+}
+
+// Execute implements interfaces.Tool.Execute
+func (at *AgentTool) Execute(ctx context.Context, args string) (string, error) {
+	agentName := at.agent.GetName()
+
+	// Log the tool execution start
+	at.logger.Debug(ctx, "Sub-agent tool execution started", map[string]interface{}{
+		"sub_agent": agentName,
+		"tool_name": at.name,
+		"raw_args":  args,
+	})
+
+	// Parse the JSON arguments
+	var params struct {
+		Query   string                 `json:"query"`
+		Context map[string]interface{} `json:"context,omitempty"`
+	}
+
+	if err := json.Unmarshal([]byte(args), &params); err != nil {
+		at.logger.Error(ctx, "Failed to parse sub-agent tool arguments", map[string]interface{}{
+			"sub_agent": agentName,
+			"tool_name": at.name,
+			"raw_args":  args,
+			"error":     err.Error(),
+		})
+		return "", fmt.Errorf("failed to parse arguments: %w", err)
+	}
+
+	if params.Query == "" {
+		at.logger.Error(ctx, "Sub-agent tool called with empty query", map[string]interface{}{
+			"sub_agent": agentName,
+			"tool_name": at.name,
+			"args":      args,
+		})
+		return "", fmt.Errorf("query parameter is required")
+	}
+
+	// Log parsed parameters
+	at.logger.Debug(ctx, "Sub-agent tool parameters parsed", map[string]interface{}{
+		"sub_agent":      agentName,
+		"tool_name":      at.name,
+		"parsed_query":   params.Query,
+		"parsed_context": params.Context,
+	})
+
+	// If context is provided, add it to the context
+	if params.Context != nil {
+		for key, value := range params.Context {
+			ctx = context.WithValue(ctx, contextKey(key), value)
+		}
+	}
+
+	return at.Run(ctx, params.Query)
+}
+
+// SetDescription allows updating the tool description
+func (at *AgentTool) SetDescription(description string) {
+	at.description = description
+}
+
+// getRecursionDepth retrieves the current recursion depth from context
+func getRecursionDepth(ctx context.Context) int {
+	if depth, ok := ctx.Value(recursionDepthKey).(int); ok {
+		return depth
+	}
+	return 0
+}
+
+// withSubAgentContext adds sub-agent context information for testing purposes
+func withSubAgentContext(ctx context.Context, parentAgent, subAgentName string) context.Context {
+	depth := getRecursionDepth(ctx)
+	ctx = context.WithValue(ctx, subAgentNameKey, subAgentName)
+	ctx = context.WithValue(ctx, parentAgentKey, parentAgent)
+	ctx = context.WithValue(ctx, recursionDepthKey, depth+1)
+	return ctx
+}
+
+// runWithStreaming runs the sub-agent with streaming and forwards events to the parent
+// runWithStreaming forwards the sub-agent's events to the parent and builds an
+// AgentResponse from what it observed.
+//
+// It returns a response rather than a bare string so the caller does not have to
+// run the sub-agent again to recover token accounting. Usage rides on the
+// completion event's metadata (see interfaces.MetadataKeyUsage).
+func (at *AgentTool) runWithStreaming(ctx context.Context, input string, forwarder interfaces.StreamForwarder, span interfaces.Span, agentName string) (*interfaces.AgentResponse, error) {
+	// Start streaming from the sub-agent
+	eventChan, err := at.agent.RunStream(ctx, input)
+	if err != nil {
+		at.logger.Error(ctx, "Failed to start sub-agent streaming", map[string]interface{}{
+			"sub_agent": agentName,
+			"error":     err.Error(),
+		})
+		return nil, fmt.Errorf("failed to start sub-agent streaming: %w", err)
+	}
+
+	// Log that we're streaming
+	at.logger.Debug(ctx, "Sub-agent streaming started", map[string]interface{}{
+		"sub_agent": agentName,
+		"tool_name": at.name,
+	})
+
+	// Collect content for final result
+	var contentBuilder strings.Builder
+	var finalError error
+	response := &interfaces.AgentResponse{AgentName: agentName}
+
+	// Forward all events and collect content
+	for event := range eventChan {
+		// Forward the event to the parent stream
+		forwarder(event)
+
+		// Collect content for the final result
+		if event.Type == interfaces.AgentEventContent {
+			contentBuilder.WriteString(event.Content)
+		}
+
+		// The completion event carries the sub-agent's token accounting. Reading
+		// it here is what makes a second execution unnecessary.
+		if event.Type == interfaces.AgentEventComplete && event.Metadata != nil {
+			if usage, ok := event.Metadata[interfaces.MetadataKeyUsage].(*interfaces.TokenUsage); ok {
+				response.Usage = usage
+			}
+			if model, ok := event.Metadata[interfaces.MetadataKeyModel].(string); ok {
+				response.Model = model
+			}
+			if summary, ok := event.Metadata[interfaces.MetadataKeyExecutionSummary].(interfaces.ExecutionSummary); ok {
+				response.ExecutionSummary = summary
+			}
+		}
+
+		// Track errors
+		if event.Error != nil {
+			finalError = event.Error
+			at.logger.Error(ctx, "Sub-agent streaming error", map[string]interface{}{
+				"sub_agent": agentName,
+				"error":     event.Error.Error(),
+			})
+		}
+
+		// Add event to span if available
+		if span != nil {
+			span.AddEvent(fmt.Sprintf("sub_agent_%s", event.Type), map[string]interface{}{
+				"type":      string(event.Type),
+				"sub_agent": agentName,
+				"has_error": event.Error != nil,
+			})
+		}
+	}
+
+	at.logger.Debug(ctx, "Sub-agent streaming completed", map[string]interface{}{
+		"sub_agent":    agentName,
+		"tool_name":    at.name,
+		"response_len": contentBuilder.Len(),
+	})
+
+	// Return error if we encountered one
+	if finalError != nil {
+		return nil, finalError
+	}
+
+	response.Content = contentBuilder.String()
+	return response, nil
+}
+
+// WithStreamForwarder adds a stream forwarder to the context
+func WithStreamForwarder(ctx context.Context, forwarder interfaces.StreamForwarder) context.Context {
+	return context.WithValue(ctx, interfaces.StreamForwarderKey, forwarder)
+}
+
+// The exported helpers below make pkg/tools the single owner of sub-agent
+// context keys.
+//
+// pkg/agent previously declared its own `type ContextKey string` with the same
+// string values ("recursion_depth", "sub_agent_name", ...). Go context keys
+// compare by type AND value, so those were a completely separate set of keys:
+// two independent recursion counters that could not observe each other. The
+// live guard is the one in this package, reached through AgentTool.Execute;
+// the pkg/agent copy was exercised only by a test and by
+// examples/subagents/depth_validation, which therefore demonstrated a recursion
+// guard that did not protect anything. pkg/agent now delegates here, since it
+// already imports pkg/tools and the dependency cannot run the other way.
+
+// WithSubAgentContext records a sub-agent invocation on ctx, incrementing the
+// recursion depth.
+func WithSubAgentContext(ctx context.Context, parentAgent, subAgentName string) context.Context {
+	return withSubAgentContext(ctx, parentAgent, subAgentName)
+}
+
+// GetRecursionDepth returns the current sub-agent recursion depth.
+func GetRecursionDepth(ctx context.Context) int {
+	return getRecursionDepth(ctx)
+}
+
+// GetSubAgentName returns the name of the sub-agent being invoked, or "".
+func GetSubAgentName(ctx context.Context) string {
+	if name, ok := ctx.Value(subAgentNameKey).(string); ok {
+		return name
+	}
+	return ""
+}
+
+// GetParentAgent returns the name of the invoking parent agent, or "".
+func GetParentAgent(ctx context.Context) string {
+	if parent, ok := ctx.Value(parentAgentKey).(string); ok {
+		return parent
+	}
+	return ""
+}
+
+// GetInvocationID returns the invocation ID for this sub-agent call, or "".
+func GetInvocationID(ctx context.Context) string {
+	if id, ok := ctx.Value(invocationIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// IsSubAgentCall reports whether ctx is inside a sub-agent invocation.
+func IsSubAgentCall(ctx context.Context) bool {
+	return GetRecursionDepth(ctx) > 0
+}
+
+// ValidateRecursionDepth reports an error when the sub-agent recursion depth
+// has exceeded MaxRecursionDepth.
+func ValidateRecursionDepth(ctx context.Context) error {
+	if depth := GetRecursionDepth(ctx); depth > MaxRecursionDepth {
+		return fmt.Errorf("maximum recursion depth %d exceeded (current: %d)", MaxRecursionDepth, depth)
+	}
+	return nil
+}

@@ -1,0 +1,25 @@
+version: 2
+
+multi-ecosystem-groups:
+  all-updates:
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Europe/Warsaw"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: "all-updates"
+    labels: ["dependencies", "automerge"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: "all-updates"
+    labels: ["dependencies", "automerge"]
